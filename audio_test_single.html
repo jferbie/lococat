@@ -1,5 +1,4 @@
 <!doctype html>
-<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -204,6 +203,25 @@
     </div>
 
     <div class="card">
+      <h1>Loco Drive</h1>
+      <div class="muted" style="margin-bottom: 8px;">Use slider to send throttle 0-100 with command <b>Txx</b>.</div>
+      <div class="row" style="margin-bottom: 8px;">
+        <span id="driveDir" class="badge">DIR: FOR</span>
+        <span id="driveThrottle" class="badge">THR: 0%</span>
+        <span id="drivePwm" class="badge">PWM: 0</span>
+      </div>
+      <div class="row" style="margin-bottom: 8px;">
+        <input id="throttleSlider" type="range" min="0" max="100" step="1" value="0" />
+        <span id="throttleValue" class="badge">0%</span>
+      </div>
+      <div class="grid">
+        <button id="forwardDirBtn" class="good">Direction FOR (D1)</button>
+        <button id="reverseDirBtn" class="warn">Direction REV (D0)</button>
+        <button id="locoStopBtn" class="danger">Loco STOP</button>
+      </div>
+    </div>
+
+    <div class="card">
       <h1>Buzzer / Amp Audio</h1>
       <div class="muted" style="margin-bottom: 8px;">Shared output pin is D10. Switch profile between buzzer and amp.</div>
       <div class="row" style="margin-bottom: 8px;">
@@ -265,9 +283,432 @@
     </div>
   </div>
 
-  <script src="app.js"></script>
-</body>
-</html>
+  <script>
+    (() => {
+      const SERVICE_UUID = "19b10000-e8f2-537e-4f6c-d104768a1214";
+      const WRITE_UUID = "19b10002-e8f2-537e-4f6c-d104768a1214";
+      const NOTIFY_UUID = "19b10001-e8f2-537e-4f6c-d104768a1214";
+
+      let device = null;
+      let server = null;
+      let service = null;
+      let writeChar = null;
+      let notifyChar = null;
+
+      const $ = (id) => document.getElementById(id);
+      const connectBtn = $("connectBtn");
+      const disconnectBtn = $("disconnectBtn");
+      const sendBtn = $("sendBtn");
+      const clearLogBtn = $("clearLogBtn");
+      const customCmd = $("customCmd");
+      const freqInput = $("freqInput");
+      const durInput = $("durInput");
+      const throttleSlider = $("throttleSlider");
+      const throttleValue = $("throttleValue");
+      const driveDir = $("driveDir");
+      const driveThrottle = $("driveThrottle");
+      const drivePwm = $("drivePwm");
+      const forwardDirBtn = $("forwardDirBtn");
+      const reverseDirBtn = $("reverseDirBtn");
+      const locoStopBtn = $("locoStopBtn");
+      const playOnceBtn = $("playOnceBtn");
+      const holdBtn = $("holdBtn");
+      const offBtn = $("offBtn");
+      const audioOutBzBtn = $("audioOutBzBtn");
+      const audioOutAmpBtn = $("audioOutAmpBtn");
+      const statBtn = $("statBtn");
+      const patternInput = $("patternInput");
+      const runPatternBtn = $("runPatternBtn");
+      const stopPatternBtn = $("stopPatternBtn");
+      const smodePulseBtn = $("smodePulseBtn");
+      const smodeAnalogBtn = $("smodeAnalogBtn");
+      const mmode2Btn = $("mmode2Btn");
+      const mmode3Btn = $("mmode3Btn");
+      const ampOnceBtn = $("ampOnceBtn");
+      const ampHoldBtn = $("ampHoldBtn");
+      const ampOffBtn = $("ampOffBtn");
+      const audioSmokeBtn = $("audioSmokeBtn");
+      const buzzerSweepBtn = $("buzzerSweepBtn");
+      const ampSweepBtn = $("ampSweepBtn");
+      const audioStopAllBtn = $("audioStopAllBtn");
+      const accAllOffBtn = $("accAllOffBtn");
+      const statusEl = $("status");
+      const deviceNameEl = $("deviceName");
+      const logEl = $("log");
+      let patternAbort = false;
+      let audioTestAbort = false;
+      let throttleDebounce = null;
+      let currentDirection = 1;
+
+      function log(msg, type = "") {
+        const ts = new Date().toLocaleTimeString();
+        const prefix = type ? `[${type}] ` : "";
+        logEl.textContent += `${ts} ${prefix}${msg}\n`;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function setStatus(text, cls = "") {
+        statusEl.textContent = text;
+        statusEl.className = "badge" + (cls ? ` ${cls}` : "");
+      }
+
+      async function connectBLE() {
+        if (!navigator.bluetooth) {
+          alert("Web Bluetooth is not available in this browser.");
+          return;
+        }
+
+        try {
+          setStatus("Connecting...", "warn-txt");
+          device = await navigator.bluetooth.requestDevice({
+            filters: [{ services: [SERVICE_UUID] }]
+          });
+
+          device.addEventListener("gattserverdisconnected", onDisconnected);
+
+          server = await device.gatt.connect();
+          service = await server.getPrimaryService(SERVICE_UUID);
+          writeChar = await service.getCharacteristic(WRITE_UUID);
+          notifyChar = await service.getCharacteristic(NOTIFY_UUID);
+
+          if (notifyChar) {
+            await notifyChar.startNotifications();
+            notifyChar.addEventListener("characteristicvaluechanged", onNotify);
+          }
+
+          deviceNameEl.textContent = `Device: ${device.name || "Unnamed"}`;
+          setStatus("Connected", "ok");
+          log("Connected to BLE device.", "OK");
+        } catch (error) {
+          setStatus("Disconnected", "err");
+          log(`Connect error: ${error.message || error}`, "ERR");
+        }
+      }
+
+      function onDisconnected() {
+        setStatus("Disconnected", "err");
+        log("Device disconnected.", "WARN");
+      }
+
+      async function disconnectBLE() {
+        try {
+          if (device && device.gatt && device.gatt.connected) {
+            device.gatt.disconnect();
+          }
+          setStatus("Disconnected", "err");
+        } catch (error) {
+          log(`Disconnect error: ${error.message || error}`, "ERR");
+        }
+      }
+
+      function onNotify(event) {
+        try {
+          const bytes = event.target.value;
+          const text = new TextDecoder().decode(bytes);
+          log(`Notify: ${text}`, "RX");
+        } catch (error) {
+          log(`Notify parse error: ${error.message || error}`, "ERR");
+        }
+      }
+
+      async function sendCommand(command) {
+        const cmd = String(command || "").trim();
+        if (!cmd) return;
+
+        if (!writeChar) {
+          log("Not connected. Connect first.", "WARN");
+          return;
+        }
+
+        try {
+          await writeChar.writeValue(new TextEncoder().encode(cmd));
+          log(`Sent: ${cmd}`, "TX");
+        } catch (error) {
+          log(`Send error: ${error.message || error}`, "ERR");
+        }
+      }
+
+      function readFreq() {
+        const val = Number(freqInput.value || 400);
+        return Math.max(300, Math.min(500, Math.round(val)));
+      }
+
+      function readDur() {
+        const val = Number(durInput.value || 250);
+        return Math.max(0, Math.min(5000, Math.round(val)));
+      }
+
+      function sleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+      }
+
+      function parsePattern(src) {
+        return String(src || "")
+          .split(",")
+          .map((p) => p.trim())
+          .filter(Boolean)
+          .map((token) => {
+            const [fRaw, msRaw] = token.split(":");
+            const f = Number(fRaw);
+            const ms = Number(msRaw);
+            if (!Number.isFinite(f) || !Number.isFinite(ms) || ms < 0) {
+              throw new Error(`Bad token: ${token}`);
+            }
+            return {
+              freq: f <= 0 ? 0 : Math.max(300, Math.min(500, Math.round(f))),
+              ms: Math.max(0, Math.min(5000, Math.round(ms)))
+            };
+          });
+      }
+
+      function bindAccPwm(index) {
+        const slider = $(`accPwm${index}`);
+        const valueBadge = $(`accPwmVal${index}`);
+        if (!slider || !valueBadge) return;
+
+        const push = () => {
+          const safe = Math.max(0, Math.min(255, Math.round(Number(slider.value) || 0)));
+          slider.value = String(safe);
+          valueBadge.textContent = String(safe);
+          sendCommand(`APWM ${index} ${safe}`);
+        };
+
+        slider.addEventListener("input", () => {
+          const safe = Math.max(0, Math.min(255, Math.round(Number(slider.value) || 0)));
+          valueBadge.textContent = String(safe);
+        });
+
+        slider.addEventListener("change", push);
+      }
+
+      function setThrottleUi(v) {
+        const safe = Math.max(0, Math.min(100, Math.round(Number(v) || 0)));
+        throttleSlider.value = String(safe);
+        throttleValue.textContent = `${safe}%`;
+        driveThrottle.textContent = `THR: ${safe}%`;
+        drivePwm.textContent = `PWM: ${Math.round((safe / 100) * 255)}`;
+        return safe;
+      }
+
+      function setDirectionUi(dir) {
+        currentDirection = dir ? 1 : 0;
+        driveDir.textContent = `DIR: ${currentDirection ? "FOR" : "REV"}`;
+      }
+
+      function queueThrottle(v) {
+        const safe = setThrottleUi(v);
+        if (throttleDebounce) clearTimeout(throttleDebounce);
+        throttleDebounce = setTimeout(() => {
+          sendCommand(`T${safe}`);
+        }, 90);
+      }
+
+      async function runPattern() {
+        if (!writeChar) {
+          log("Not connected. Connect first.", "WARN");
+          return;
+        }
+
+        let steps;
+        try {
+          steps = parsePattern(patternInput.value);
+        } catch (error) {
+          log(error.message || String(error), "ERR");
+          return;
+        }
+
+        if (!steps.length) {
+          log("Pattern is empty.", "WARN");
+          return;
+        }
+
+        patternAbort = false;
+        log(`Pattern start (${steps.length} steps)`, "SEQ");
+
+        for (const step of steps) {
+          if (patternAbort) break;
+
+          if (step.freq > 0) {
+            await sendCommand(`BZ ${step.freq} ${step.ms}`);
+            await sleep(step.ms + 20);
+          } else {
+            await sendCommand("BZOFF");
+            await sleep(step.ms);
+          }
+        }
+
+        await sendCommand("BZOFF");
+        log(patternAbort ? "Pattern stopped." : "Pattern complete.", "SEQ");
+      }
+
+      async function runAudioSmokeTest() {
+        if (!writeChar) {
+          log("Not connected. Connect first.", "WARN");
+          return;
+        }
+
+        audioTestAbort = false;
+        log("Audio smoke test start", "TEST");
+
+        const steps = [
+          "BZ 350 180",
+          "BZ 450 180",
+          "AMP 350 180",
+          "AMP 700 220"
+        ];
+
+        for (const cmd of steps) {
+          if (audioTestAbort) break;
+          await sendCommand(cmd);
+          await sleep(260);
+        }
+
+        await sendCommand("AUDIOOFF");
+        log(audioTestAbort ? "Audio smoke test stopped." : "Audio smoke test complete.", "TEST");
+      }
+
+      async function runSweep(output) {
+        if (!writeChar) {
+          log("Not connected. Connect first.", "WARN");
+          return;
+        }
+
+        audioTestAbort = false;
+        const isBuzzer = output === "BZ";
+        const start = isBuzzer ? 300 : 300;
+        const end = isBuzzer ? 500 : 1000;
+        const step = isBuzzer ? 25 : 50;
+        const duration = 140;
+
+        log(`${isBuzzer ? "Buzzer" : "Amp"} sweep start ${start}-${end}Hz`, "TEST");
+
+        for (let freq = start; freq <= end; freq += step) {
+          if (audioTestAbort) break;
+          await sendCommand(`${output} ${freq} ${duration}`);
+          await sleep(duration + 25);
+        }
+
+        await sendCommand(isBuzzer ? "BZOFF" : "AMPOFF");
+        log(audioTestAbort ? "Sweep stopped." : "Sweep complete.", "TEST");
+      }
+
+      connectBtn.addEventListener("click", connectBLE);
+      disconnectBtn.addEventListener("click", disconnectBLE);
+
+      sendBtn.addEventListener("click", () => sendCommand(customCmd.value));
+      customCmd.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") sendCommand(customCmd.value);
+      });
+
+      clearLogBtn.addEventListener("click", () => {
+        logEl.textContent = "";
+      });
+
+      throttleSlider.addEventListener("input", () => {
+        queueThrottle(throttleSlider.value);
+      });
+
+      throttleSlider.addEventListener("change", () => {
+        const safe = setThrottleUi(throttleSlider.value);
+        sendCommand(`T${safe}`);
+      });
+
+      forwardDirBtn.addEventListener("click", () => {
+        setDirectionUi(1);
+        sendCommand("D1");
+      });
+
+      reverseDirBtn.addEventListener("click", () => {
+        setDirectionUi(0);
+        sendCommand("D0");
+      });
+
+      locoStopBtn.addEventListener("click", () => {
+        setThrottleUi(0);
+        sendCommand("STOP");
+      });
+
+      playOnceBtn.addEventListener("click", () => {
+        sendCommand(`BZ ${readFreq()} ${readDur()}`);
+      });
+
+      audioOutBzBtn.addEventListener("click", () => {
+        sendCommand("AOUT BZ");
+      });
+
+      audioOutAmpBtn.addEventListener("click", () => {
+        sendCommand("AOUT AMP");
+      });
+
+      holdBtn.addEventListener("click", () => {
+        sendCommand(`BZ ${readFreq()} 0`);
+      });
+
+      offBtn.addEventListener("click", () => {
+        patternAbort = true;
+        sendCommand("BZOFF");
+      });
+
+      ampOnceBtn.addEventListener("click", () => {
+        sendCommand(`AMP ${readFreq()} ${readDur()}`);
+      });
+
+      ampHoldBtn.addEventListener("click", () => {
+        sendCommand(`AMP ${readFreq()} 0`);
+      });
+
+      ampOffBtn.addEventListener("click", () => {
+        sendCommand("AMPOFF");
+      });
+
+      smodePulseBtn.addEventListener("click", () => sendCommand("SMODE PULSE"));
+      smodeAnalogBtn.addEventListener("click", () => sendCommand("SMODE ANALOG"));
+      mmode2Btn.addEventListener("click", () => sendCommand("MMODE 2"));
+      mmode3Btn.addEventListener("click", () => sendCommand("MMODE 3"));
+
+      statBtn.addEventListener("click", () => sendCommand("STAT"));
+
+      runPatternBtn.addEventListener("click", () => {
+        runPattern();
+      });
+
+      stopPatternBtn.addEventListener("click", () => {
+        patternAbort = true;
+        sendCommand("BZOFF");
+      });
+
+      audioSmokeBtn.addEventListener("click", () => {
+        runAudioSmokeTest();
+      });
+
+      buzzerSweepBtn.addEventListener("click", () => {
+        runSweep("BZ");
+      });
+
+      ampSweepBtn.addEventListener("click", () => {
+        runSweep("AMP");
+      });
+
+      audioStopAllBtn.addEventListener("click", () => {
+        audioTestAbort = true;
+        patternAbort = true;
+        sendCommand("AUDIOOFF");
+      });
+
+      for (let i = 1; i <= 6; i += 1) {
+        bindAccPwm(i);
+      }
+
+      accAllOffBtn.addEventListener("click", () => {
+        for (let i = 1; i <= 6; i += 1) {
+          const slider = $(`accPwm${i}`);
+          const valueBadge = $(`accPwmVal${i}`);
+          if (slider) slider.value = "0";
+          if (valueBadge) valueBadge.textContent = "0";
+          sendCommand(`APWM ${i} 0`);
+        }
+      });
+
       document.querySelectorAll("button[data-cmd]").forEach((btn) => {
         btn.addEventListener("click", () => {
           sendCommand(btn.getAttribute("data-cmd"));
